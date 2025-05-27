@@ -1,0 +1,374 @@
+1терминал 
+python -m venv venv
+
+venv\Scripts\activate
+
+2вставляем код
+
+import time
+import re
+import asyncio
+import uuid
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Union, Any
+
+try:
+    import Levenshtein
+
+
+    def calculate_levenshtein(word1: str, word2: str) -> int:
+        return Levenshtein.distance(word1, word2)
+
+
+    def calculate_damerau_levenshtein(word1: str, word2: str) -> int:
+
+        return Levenshtein.distance(word1, word2)
+
+except ImportError:
+    print(
+        "ПРЕДУПРЕЖДЕНИЕ: Библиотека Levenshtein не найдена. Используются базовые реализации на чистом Python (медленнее).")
+    print("Установите ее: pip install python-Levenshtein")
+
+
+    def calculate_levenshtein(s1, s2):
+        if len(s1) < len(s2):
+            return calculate_levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
+
+
+    def calculate_damerau_levenshtein(s1: str, s2: str) -> int:
+
+        len_s1 = len(s1)
+        len_s2 = len(s2)
+        d = {}
+
+        for i in range(-1, len_s1 + 1):
+            d[(i, -1)] = i + 1
+        for j in range(-1, len_s2 + 1):
+            d[(-1, j)] = j + 1
+
+        for i in range(len_s1):
+            for j in range(len_s2):
+                cost = 0 if s1[i] == s2[j] else 1
+                d[(i, j)] = min(
+                    d[(i - 1, j)] + 1,
+                    d[(i, j - 1)] + 1,
+                    d[(i - 1, j - 1)] + cost,
+                )
+
+                if i > 0 and j > 0 and s1[i] == s2[j - 1] and s1[i - 1] == s2[j]:
+                    d[(i, j)] = min(d[(i, j)], d[(i - 2, j - 2)] + 1)
+        return d[(len_s1 - 1, len_s2 - 1)]
+
+corpuses_storage: Dict[int, Dict] = {}
+next_corpus_id: int = 1
+
+
+class CorpusUploadRequest(BaseModel):
+    corpus_name: str
+    text: str
+
+
+class CorpusUploadResponse(BaseModel):
+    corpus_id: int
+    message: str
+
+
+class CorpusInfo(BaseModel):
+    id: int
+    name: str
+
+
+class CorpusListResponse(BaseModel):
+    corpuses: List[CorpusInfo]
+
+
+class SearchRequest(BaseModel):
+    word: str
+    algorithm: str
+    corpus_id: int
+    max_distance: Optional[int] = None
+    client_id: str
+
+
+class SearchInitiatedResponse(BaseModel):
+    message: str
+    task_id: str
+
+
+class SearchResultItem(BaseModel):
+    word: str
+    distance: int
+
+
+class TaskStartedMessage(BaseModel):
+    status: str = "STARTED"
+    task_id: str
+    word: str
+    algorithm: str
+
+
+class TaskProgressMessage(BaseModel):
+    status: str = "PROGRESS"
+    task_id: str
+    progress: int  
+    current_word_processed_count: int
+    total_words_to_process: int
+
+
+class TaskCompletedMessage(BaseModel):
+    status: str = "COMPLETED"
+    task_id: str
+    execution_time: float
+    results: List[SearchResultItem]
+
+
+class TaskErrorMessage(BaseModel):
+    status: str = "ERROR"
+    task_id: str
+    error: str
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, client_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        print(f"Клиент {client_id} подключен. Всего клиентов: {len(self.active_connections)}")
+
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+            print(f"Клиент {client_id} отключен. Всего клиентов: {len(self.active_connections)}")
+
+    async def send_personal_message(self, message: Union[
+        TaskStartedMessage, TaskProgressMessage, TaskCompletedMessage, TaskErrorMessage], client_id: str):
+        if client_id in self.active_connections:
+            websocket = self.active_connections[client_id]
+            try:
+                await websocket.send_json(message.model_dump())  
+            except WebSocketDisconnect:
+                print(f"Клиент {client_id} отключился до того, как сообщение могло быть отправлено.")
+                self.disconnect(client_id)
+            except RuntimeError as e:  # Может произойти, если соединение закрывается
+                print(f"RuntimeError при отправке клиенту {client_id}: {e}. Предполагается отключение.")
+                self.disconnect(client_id)
+        else:
+            print(f"Клиент {client_id} не найден для отправки сообщения.")
+
+
+manager = ConnectionManager()
+
+app = FastAPI(title="API Нечеткого Поиска с WebSocket")
+
+
+def tokenize_and_clean(text: str) -> List[str]:
+    text = text.lower()
+    text = re.sub(r'[^\w\s-]', '', text)
+    words = text.split()
+    words = [word for word in words if word]
+    return list(set(words))
+
+
+async def perform_search_and_notify(
+        task_id: str,
+        client_id: str,
+        search_word: str,
+        algorithm_name: str,
+        corpus_words: List[str],
+        distance_func: callable,
+        max_distance: Optional[int]
+):
+    start_time = time.monotonic()
+    results = []
+    total_words = len(corpus_words)
+
+    await manager.send_personal_message(
+        TaskStartedMessage(task_id=task_id, word=search_word, algorithm=algorithm_name),
+        client_id
+    )
+
+    try:
+        for i, corpus_word in enumerate(corpus_words):
+            distance = distance_func(search_word, corpus_word)
+            if max_distance is None or distance <= max_distance:
+                results.append(SearchResultItem(word=corpus_word, distance=distance))
+
+            if total_words > 0 and ((i + 1) % max(1, total_words // 20) == 0 or (i + 1) == total_words):
+                progress_percentage = int(((i + 1) / total_words) * 100)
+                await manager.send_personal_message(
+                    TaskProgressMessage(
+                        task_id=task_id,
+                        progress=progress_percentage,
+                        current_word_processed_count=i + 1,
+                        total_words_to_process=total_words
+                    ),
+                    client_id
+                )
+                await asyncio.sleep(0.001)
+
+        end_time = time.monotonic()
+        execution_time = end_time - start_time
+        results.sort(key=lambda item: item.distance)
+
+        await manager.send_personal_message(
+            TaskCompletedMessage(
+                task_id=task_id,
+                execution_time=execution_time,
+                results=results
+            ),
+            client_id
+        )
+    except Exception as e:
+        print(f"Ошибка во время выполнения задачи поиска {task_id} для клиента {client_id}: {e}")
+        await manager.send_personal_message(
+            TaskErrorMessage(task_id=task_id, error=str(e)),
+            client_id
+        )
+
+
+@app.post("/upload_corpus", response_model=CorpusUploadResponse)
+async def upload_corpus_endpoint(request: CorpusUploadRequest):
+    global next_corpus_id
+    corpus_id = next_corpus_id
+    words = tokenize_and_clean(request.text)
+    corpuses_storage[corpus_id] = {"name": request.corpus_name, "words": words}
+    next_corpus_id += 1
+    return CorpusUploadResponse(corpus_id=corpus_id, message="Корпус успешно загружен")
+
+
+@app.get("/corpuses", response_model=CorpusListResponse)
+async def get_corpuses_endpoint():
+    corpus_list = [CorpusInfo(id=cid, name=data["name"]) for cid, data in corpuses_storage.items()]
+    return CorpusListResponse(corpuses=corpus_list)
+
+
+@app.post("/search_algorithm", response_model=SearchInitiatedResponse)
+async def search_algorithm_endpoint(request: SearchRequest, background_tasks: BackgroundTasks):
+    if request.client_id not in manager.active_connections:
+        raise HTTPException(status_code=404, detail=f"Клиент {request.client_id} не подключен через WebSocket.")
+
+    if request.corpus_id not in corpuses_storage:
+        raise HTTPException(status_code=404, detail=f"Корпус с id {request.corpus_id} не найден")
+
+    corpus_data = corpuses_storage[request.corpus_id]
+    corpus_words = corpus_data["words"]
+    search_word_cleaned = request.word.lower()  
+
+    if request.algorithm == "levenshtein":
+        distance_func = calculate_levenshtein
+    elif request.algorithm == "damerau_levenshtein":
+        distance_func = calculate_damerau_levenshtein
+    else:
+        raise HTTPException(status_code=400,
+                            detail=f"Неизвестный алгоритм: {request.algorithm}. Доступные: levenshtein, damerau_levenshtein")
+
+    task_id = str(uuid.uuid4())
+
+    background_tasks.add_task(
+        perform_search_and_notify,
+        task_id=task_id,
+        client_id=request.client_id,
+        search_word=search_word_cleaned,
+        algorithm_name=request.algorithm,
+        corpus_words=corpus_words,
+        distance_func=distance_func,
+        max_distance=request.max_distance
+    )
+
+    return SearchInitiatedResponse(message="Задача поиска успешно запущена.", task_id=task_id)
+
+
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    await manager.connect(client_id, websocket)
+    try:
+        while True:
+
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+    except Exception as e:
+        print(f"Ошибка WebSocket для клиента {client_id}: {e}")
+        manager.disconnect(client_id)
+
+
+@app.get("/")
+async def read_root():
+    return {
+        "message": "API Нечеткого Поиска с WebSocket-уведомлениями запущено. Подключайтесь к /ws/{client_id} и переходите в /docs для документации API."}
+
+3 терминал
+pip install fastapi "uvicorn[standard]" python-Levenshtein websockets
+
+4 терминал запускаем сервер
+uvicorn main:app --reload
+
+5 открываем в браузере 
+http://127.0.0.1:8000/docs
+
+6 открываем консоль режима разработчика на сайте f12 и вводим и нажимаем enter
+const clientId = "testclient123"; 
+const socket = new WebSocket(`ws://127.0.0.1:8000/ws/${clientId}`);
+
+socket.onopen = function(event) {
+    console.log("WebSocket Соединение установлено!");
+
+};
+
+socket.onmessage = function(event) {
+    console.log("Получено сообщение от сервера:", JSON.parse(event.data));
+};
+
+socket.onclose = function(event) {
+    if (event.wasClean) {
+        console.log(`Соединение закрыто чисто, код=${event.code} причина=${event.reason}`);
+    } else {
+        console.error('Соединение прервано');
+    }
+};
+
+socket.onerror = function(error) {
+    console.error(`[Ошибка WebSocket] ${error.message}`);
+};
+
+7 открываем post upload corpus нажимаем try out вставляем
+{
+  "corpus_name": "мой_тестовый_корпус",
+  "text": "Пример текста для проверки. Это слово пример, а это образец. Ещё один пример."
+}
+
+8 открываем post search algorithm и вставляем
+{
+  "word": "приме",
+  "algorithm": "levenshtein",
+  "corpus_id": 1,
+  "max_distance": 2,
+  "client_id": "testclient123"
+}
+
+
+
+
+
+
+
+
